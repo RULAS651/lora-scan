@@ -20,9 +20,13 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
+          cache-dependency-path: |
+            package.json
+            apps/backend/package.json
+            apps/frontend/package.json
 
       - name: Install
-        run: npm install --no-audit --no-fund
+        run: npm install --no-audit --no-fund --include=dev
 
       - name: Audit
         run: npm audit --audit-level=high || (echo "::warning::npm audit found issues; see log above" && exit 0)
