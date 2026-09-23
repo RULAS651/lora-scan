@@ -18,6 +18,11 @@ jobs:
     name: Backend typecheck & validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # Never connected to -- prisma only has to resolve and parse it. Must be
+      # a postgresql:// URL: the schema's provider is postgresql, and a
+      # `file:` URL is rejected before validation even starts.
+      DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci?schema=public"
     defaults:
       run:
         working-directory: apps/backend
@@ -36,6 +41,14 @@ jobs:
         run: |
           cd ../..
           npm install --no-audit --no-fund --include=dev
+
+      # The shared rules package is consumed as a built package (its .d.ts),
+      # so it has to exist before anything typechecks against it. The npm
+      # scripts chain this automatically; the bare `npx tsc` below does not.
+      - name: Build shared packages
+        run: |
+          cd ../..
+          npm run build:packages
 
       - name: Generate Prisma client
         run: npx prisma generate
@@ -80,13 +93,20 @@ jobs:
           cd ../..
           cp -n .env.example .env || true
 
+      # Same reason as the backend job: @lora-scan/face-qc is imported by the
+      # capture components, and `npx tsc` cannot see it until it is built.
+      - name: Build shared packages
+        run: |
+          cd ../..
+          npm run build:packages
+
       - name: TypeScript typecheck
         run: npx tsc --noEmit
 
       - name: Next.js build
         env:
           # Dummy values so build has access to env types it might read
-          DATABASE_URL: "file:./ci.db"
+          DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci?schema=public"
           JWT_SECRET: "dummy-ci-jwt-secret-please-change-me-0000000000000000000000000000000000000000000000000000000000000000"
           ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         run: npx next build
@@ -110,4 +130,6 @@ jobs:
           test -f apps/backend/prisma/schema.prisma
           test -f apps/frontend/package.json
           test -f apps/frontend/app/layout.tsx
+          test -f packages/face-qc/package.json
+          test -f packages/face-qc/src/thresholds.ts
           echo "All required files present."
