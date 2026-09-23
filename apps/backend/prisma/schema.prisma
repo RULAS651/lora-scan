@@ -1,0 +1,242 @@
+// Prisma schema for the LoRA Scan Privacy Platform
+// SQLite via Prisma — swap provider for Postgres/MySQL in production.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Member + auth
+// ---------------------------------------------------------------------------
+
+enum Role {
+  MEMBER
+  ADMIN
+}
+
+model Member {
+  id                String   @id @default(cuid())
+  email             String   @unique
+  passwordHash      String
+  role              Role     @default(MEMBER)
+  privacyConsentAt  DateTime?
+  deIdentifyDefault Boolean  @default(false)
+  ttlHoursOverride  Int?     // member override for scan TTL in hours
+  createdAt         DateTime @default(now())
+  lastActiveAt      DateTime @default(now())
+
+  sessions          RefreshSession[]
+  scanSessions      ScanSession[]
+  loras             LoRA[]
+  auditLogs         AuditLog[]
+  jobs              TrainingJob[]
+}
+
+model RefreshSession {
+  id         String   @id @default(cuid())
+  memberId   String
+  tokenHash  String   @unique
+  ip         String?
+  userAgent  String?
+  revokedAt  DateTime?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  member     Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId])
+}
+
+// ---------------------------------------------------------------------------
+// Face scanning
+// ---------------------------------------------------------------------------
+
+enum ScanSessionStatus {
+  DRAFT      // member is still uploading images
+  FINALIZED  // submitted for training
+  TRAINING   // training job dispatched
+  COMPLETE   // LoRA ready
+  FAILED     // training failed
+  PURGED     // raw images auto-deleted (metadata kept)
+  DELETED    // member/admin wiped it
+}
+
+enum ScanAngle {
+  FRONT
+  ANGLE_45L
+  ANGLE_45R
+  PROFILE_L
+  PROFILE_R
+  TOP
+  BOTTOM
+  OTHER
+}
+
+model ScanSession {
+  id              String              @id @default(cuid())
+  memberId        String
+  status          ScanSessionStatus   @default(DRAFT)
+  triggerWord     String              // unique per-session token, e.g. "ohwx123"
+  deIdentified    Boolean             @default(false)
+  purgeScheduledAt DateTime?           // when raw scans will be auto-deleted
+  deletedAt       DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  member          Member              @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  images          ScanImage[]
+  job             TrainingJob?
+  lora            LoRA?
+
+  @@index([memberId, status])
+}
+
+model ScanImage {
+  id                String     @id @default(cuid())
+  scanSessionId     String
+  angle             ScanAngle
+  // Encrypted blob: path on disk under apps/backend/storage/
+  // AES-256-GCM.  IV + auth tag stored in the blob header.
+  blobPath          String
+  blobSha256        String
+  blobSizeBytes     Int
+  width             Int?
+  height            Int?
+  deIdentified      Boolean    @default(false)
+  createdAt         DateTime   @default(now())
+  deletedAt         DateTime?
+
+  scanSession       ScanSession @relation(fields: [scanSessionId], references: [id], onDelete: Cascade)
+
+  @@index([scanSessionId])
+}
+
+// ---------------------------------------------------------------------------
+// LoRA artifacts
+// ---------------------------------------------------------------------------
+
+enum LoRAStatus {
+  TRAINING
+  READY
+  FAILED
+  REVOKED          // member/admin requested access freeze
+  DELETED
+}
+
+model LoRA {
+  id              String      @id @default(cuid())
+  memberId        String
+  scanSessionId   String
+  status          LoRAStatus  @default(TRAINING)
+  triggerWord     String
+  blobPath        String?     // encrypted safetensors file; null until ready
+  blobSha256      String?
+  blobSizeBytes   Int?
+  trainingSteps   Int?
+  rank            Int?
+  learningRate    Float?
+  previewUrls     String[]    @default([])
+  deletedAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  member          Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  scanSession     ScanSession @relation(fields: [scanSessionId], references: [id])
+  audits          AuditLog[]
+
+  @@index([memberId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Training jobs (RunPod / ComfyUI orchestration)
+// ---------------------------------------------------------------------------
+
+enum JobStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model TrainingJob {
+  id             String     @id @default(cuid())
+  memberId       String
+  scanSessionId  String     @unique
+  runpodJobId    String?    @unique
+  status         JobStatus  @default(PENDING)
+  provider       String     @default("RUNPOD")
+  workflowJson   Json?
+  retries        Int        @default(0)
+  maxRetries     Int        @default(2)
+  errorMessage   String?
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  webhookUrl     String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  member         Member     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  scanSession    ScanSession @relation(fields: [scanSessionId], references: [id])
+
+  @@index([memberId, status])
+  @@index([runpodJobId])
+}
+
+// ---------------------------------------------------------------------------
+// Append-only audit log (immutable in application layer)
+// ---------------------------------------------------------------------------
+
+enum AuditAction {
+  // Auth
+  LOGIN
+  LOGOUT
+  REGISTER
+  REFRESH_TOKEN
+  REVOKE_TOKENS
+  // Scan
+  SCAN_SESSION_CREATE
+  SCAN_IMAGE_UPLOAD
+  SCAN_SESSION_FINALIZE
+  SCAN_SESSION_PURGE_TTL
+  // LoRA
+  LORA_CREATE
+  LORA_DOWNLOAD
+  LORA_PREVIEW_GENERATE
+  LORA_REVOKE
+  // Deletion
+  MEMBER_SELF_DELETE
+  MEMBER_WIPE_ACCOUNT
+  ADMIN_FORCE_DELETE_LORA
+  ADMIN_FORCE_DELETE_SCANS
+  ADMIN_WIPE_MEMBER
+  // Admin
+  ADMIN_LOGIN
+  ADMIN_AUDIT_VIEW
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  memberId  String?     // null for non-member actions (e.g. failed login attempts tracked elsewhere)
+  actorId   String?     // who performed it (same as memberId for self, admin id for admin ops)
+  action    AuditAction
+  targetId  String?     // e.g. loraId or scanSessionId
+  reason    String?     // admin-provided reason for force ops
+  ip        String?
+  userAgent String?
+  metadata  Json?       // extra details (e.g. { bytes: 1234 })
+  createdAt DateTime    @default(now())
+
+  member    Member?     @relation("AuditMember", fields: [memberId], references: [id], onDelete: SetNull)
+  actor     Member?     @relation("AuditActor",  fields: [actorId],  references: [id], onDelete: SetNull)
+  lora      LoRA?       @relation(fields: [targetId], references: [id], onDelete: SetNull)
+
+  @@index([memberId, action, createdAt])
+  @@index([actorId, action, createdAt])
+}

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # Backend: typecheck + prisma validate + test (if any)
+  # ---------------------------------------------------------------
+  backend:
+    name: Backend typecheck & validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            apps/backend/package.json
+            apps/frontend/package.json
+
+      - name: Install (root + all workspaces)
+        run: |
+          cd ../..
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Validate Prisma schema
+        run: npx prisma validate
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npm test --if-present
+
+  # ---------------------------------------------------------------
+  # Frontend: typecheck + next build (catches runtime errors)
+  # ---------------------------------------------------------------
+  frontend:
+    name: Frontend typecheck & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            apps/backend/package.json
+            apps/frontend/package.json
+
+      - name: Install (root + all workspaces)
+        run: |
+          cd ../..
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Copy env example for build (secrets not needed for typecheck)
+        run: |
+          cd ../..
+          cp -n .env.example .env || true
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+      - name: Next.js build
+        env:
+          # Dummy values so build has access to env types it might read
+          DATABASE_URL: "file:./ci.db"
+          JWT_SECRET: "dummy-ci-jwt-secret-please-change-me-0000000000000000000000000000000000000000000000000000000000000000"
+          ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        run: npx next build
+
+  # ---------------------------------------------------------------
+  # Lint / root-level structural checks (package files present, etc.)
+  # ---------------------------------------------------------------
+  meta:
+    name: Repository metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required files exist
+        run: |
+          set -e
+          test -f package.json
+          test -f .env.example
+          test -f apps/backend/package.json
+          test -f apps/backend/src/server.ts
+          test -f apps/backend/prisma/schema.prisma
+          test -f apps/frontend/package.json
+          test -f apps/frontend/app/layout.tsx
+          echo "All required files present."
