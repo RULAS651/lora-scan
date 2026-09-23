@@ -1,12 +1,16 @@
 // Prisma schema for the LoRA Scan Privacy Platform
-// SQLite via Prisma — swap provider for Postgres/MySQL in production.
+//
+// PROVIDER: postgresql. This is not interchangeable with sqlite here -- the
+// schema relies on enums, a scalar list (LoRA.previewUrls) and JSON-ish columns,
+// and Prisma's sqlite connector supports none of them. `docker compose up -d db`
+// brings up a local Postgres that matches DATABASE_URL in .env.example.
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -33,7 +37,11 @@ model Member {
   sessions          RefreshSession[]
   scanSessions      ScanSession[]
   loras             LoRA[]
-  auditLogs         AuditLog[]
+  // AuditLog points at Member twice: `member` is who the entry is ABOUT,
+  // `actor` is who performed it (the two differ on every admin action). Both
+  // back-relations must exist and must carry the matching relation name.
+  auditLogs         AuditLog[]  @relation("AuditMember")
+  auditActions      AuditLog[]  @relation("AuditActor")
   jobs              TrainingJob[]
 }
 
@@ -72,9 +80,27 @@ enum ScanAngle {
   ANGLE_45R
   PROFILE_L
   PROFILE_R
+  BACK
   TOP
   BOTTOM
   OTHER
+}
+
+// How far the camera was. Orthogonal to angle, and tracked separately because
+// a set of nothing but head shots trains a face that sits on a drifting body:
+// full-body frames are the only thing that teaches build and proportion.
+enum ScanDistance {
+  CLOSEUP
+  UPPER_BODY
+  FULL_BODY
+}
+
+// Where the frame came from. Video frames are held to the same framing rules
+// as uploads; this only records provenance.
+enum ImageSource {
+  UPLOAD
+  CAMERA
+  VIDEO
 }
 
 model ScanSession {
@@ -108,6 +134,21 @@ model ScanImage {
   width             Int?
   height            Int?
   deIdentified      Boolean    @default(false)
+
+  distance          ScanDistance @default(CLOSEUP)
+  source            ImageSource  @default(UPLOAD)
+
+  // Framing QC, recorded at upload so a bad set can be explained after the
+  // fact. Null on rows written before QC existed, or by a deployment with no
+  // detector configured -- absent is not the same as passed.
+  qcSeverity        String?    // ok | warn | reject | unknown
+  qcDetector        String?    // which model judged it
+  qcAuthoritative   Boolean?   // was that the same model the trainer uses
+  qcFaces           Int?
+  qcFacePx          Int?
+  qcFaceAreaPct     Float?
+  qcReasons         String?    // JSON array of plain-language strings
+
   createdAt         DateTime   @default(now())
   deletedAt         DateTime?
 
@@ -131,7 +172,7 @@ enum LoRAStatus {
 model LoRA {
   id              String      @id @default(cuid())
   memberId        String
-  scanSessionId   String
+  scanSessionId   String      @unique
   status          LoRAStatus  @default(TRAINING)
   triggerWord     String
   blobPath        String?     // encrypted safetensors file; null until ready
@@ -172,7 +213,8 @@ model TrainingJob {
   runpodJobId    String?    @unique
   status         JobStatus  @default(PENDING)
   provider       String     @default("RUNPOD")
-  workflowJson   Json?
+  // JSON-encoded text — see the note on AuditLog.metadata.
+  workflowJson   String?
   retries        Int        @default(0)
   maxRetries     Int        @default(2)
   errorMessage   String?
@@ -230,7 +272,9 @@ model AuditLog {
   reason    String?     // admin-provided reason for force ops
   ip        String?
   userAgent String?
-  metadata  Json?       // extra details (e.g. { bytes: 1234 })
+  // JSON-encoded text, not a Json column: the sqlite connector has no native
+  // JSON type. Swap to Json here if you move this datasource to Postgres.
+  metadata  String?     // extra details, serialized (e.g. {"bytes":1234})
   createdAt DateTime    @default(now())
 
   member    Member?     @relation("AuditMember", fields: [memberId], references: [id], onDelete: SetNull)

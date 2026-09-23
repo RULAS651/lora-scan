@@ -34,7 +34,7 @@ export function auditLog(decide: AuditDecideFn) {
             targetId: resolved.targetId ?? undefined,
             ip: req.ip ?? undefined,
             userAgent: req.headers["user-agent"] ?? undefined,
-            metadata: resolved.extra ?? undefined,
+            metadata: resolved.extra ? JSON.stringify(resolved.extra) : undefined,
           },
         });
       } catch (e) {
@@ -68,7 +68,7 @@ export async function writeAudit(params: {
         reason: params.reason ?? undefined,
         ip: params.ip ?? undefined,
         userAgent: params.userAgent ?? undefined,
-        metadata: params.metadata ?? undefined,
+        metadata: params.metadata ? JSON.stringify(params.metadata) : undefined,
       },
     });
   } catch (e) {

@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@lora-scan/face-qc": "*",
     "@mediapipe/tasks-vision": "^0.10.14",
     "axios": "^1.7.2",
     "next": "14.2.3",

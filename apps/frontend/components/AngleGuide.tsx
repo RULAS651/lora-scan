@@ -2,7 +2,10 @@
 
 import React from "react";
 
-export type AngleKey = "FRONT" | "ANGLE_45L" | "ANGLE_45R" | "PROFILE_L" | "PROFILE_R";
+// Mirrors the ScanAngle enum in prisma/schema.prisma and AngleKey in
+// @lora-scan/face-qc. BACK is part of the shot plan: full-body frames from
+// behind teach build and hair, and no face detector will read them.
+export type AngleKey = "FRONT" | "ANGLE_45L" | "ANGLE_45R" | "PROFILE_L" | "PROFILE_R" | "BACK";
 
 interface Props {
   angle: AngleKey;
@@ -29,6 +32,7 @@ export default function AngleGuide({ angle, size = 480 }: Props) {
     ANGLE_45R: { dx:  size * 0.08, dEye: 0,    label: "45° Right",  hint: "Turn right ~45° (left side of face more visible)" },
     PROFILE_L: { dx: -size * 0.14, dEye: 0,    label: "Profile L",  hint: "Full left profile (look left)" },
     PROFILE_R: { dx:  size * 0.14, dEye: 0,    label: "Profile R",  hint: "Full right profile (look right)" },
+    BACK:      { dx: 0,            dEye: 0,    label: "Back",       hint: "Turn fully away from the camera — no face needed in this one" },
   };
   const t = TARGET[angle];
 

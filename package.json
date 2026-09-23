@@ -4,7 +4,8 @@
   "private": true,
   "workspaces": [
     "apps/backend",
-    "apps/frontend"
+    "apps/frontend",
+    "packages/*"
   ],
   "scripts": {
     "dev:backend": "npm run dev --workspace=apps/backend",
@@ -12,10 +13,17 @@
     "dev": "concurrently -n backend,frontend -c magenta,cyan \"npm:dev:backend\" \"npm:dev:frontend\"",
     "build:backend": "npm run build --workspace=apps/backend",
     "build:frontend": "npm run build --workspace=apps/frontend",
-    "build": "npm run build:backend && npm run build:frontend",
+    "build": "npm run build:packages && npm run build:backend && npm run build:frontend",
     "test:backend": "npm run test --workspace=apps/backend",
     "migrate:dev": "npm run prisma:migrate --workspace=apps/backend",
-    "migrate:generate": "npm run prisma:generate --workspace=apps/backend"
+    "migrate:generate": "npm run prisma:generate --workspace=apps/backend",
+    "build:packages": "npm run build --workspace=packages/face-qc",
+    "test:packages": "npm run test --workspace=packages/face-qc",
+    "test": "npm run test:packages && npm run test:backend",
+    "predev": "npm run build:packages",
+    "predev:backend": "npm run build:packages",
+    "predev:frontend": "npm run build:packages",
+    "pretest:backend": "npm run build:packages"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

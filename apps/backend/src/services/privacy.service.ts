@@ -32,7 +32,11 @@ function loadKeys() {
 // ===== Member-scoped key derivation ======================================
 // Derive a per-member key with HKDF so the master key isn't used directly.
 function deriveMemberKey(masterKey: Buffer, memberId: string) {
-  return crypto.createHkdf("sha256", masterKey, Buffer.from("member-key-salt"), Buffer.from(memberId), 32);
+  // hkdfSync, not createHkdf (which does not exist), and it hands back an
+  // ArrayBuffer -- everything downstream expects a Buffer.
+  return Buffer.from(
+    crypto.hkdfSync("sha256", masterKey, Buffer.from("member-key-salt"), Buffer.from(memberId), 32),
+  );
 }
 
 // ===== Low-level crypto ==================================================
@@ -174,8 +178,8 @@ export async function deIdentifyFace(input: Buffer, faceBbox?: { x: number; y: n
   const faceCrop = await sharp(cloned)
     .extract({ left: clamp(bbox.x, 0, imgW - 1), top: clamp(bbox.y, 0, imgH - 1),
                width: clamp(bbox.w, 1, imgW - bbox.x), height: clamp(bbox.h, 1, imgH - bbox.y) })
-    .resize(16, 16, { kernel: "pixel" })
-    .resize(bbox.w, bbox.h, { kernel: "pixel" })
+    .resize(16, 16, { kernel: "nearest" })
+    .resize(bbox.w, bbox.h, { kernel: "nearest" })
     .png()
     .toBuffer();
 

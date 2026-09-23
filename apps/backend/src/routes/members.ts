@@ -1,7 +1,8 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import { PrismaClient, Role } from "@prisma/client";
-import { getMemberDashboardSummary, wipeMemberAccount } from "../services/lora.service";
+import { getMemberDashboardSummary } from "../services/lora.service";
+import { wipeMemberAccount } from "../services/privacy.service";
 import { auditLog } from "../middleware/auditLog";
 import { writeAudit } from "../middleware/auditLog";
 

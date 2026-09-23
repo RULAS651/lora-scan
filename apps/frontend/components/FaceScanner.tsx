@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
+import { checkFrame, DEFAULT_THRESHOLDS, type PhotoVerdict } from "@lora-scan/face-qc";
 import type { AngleKey } from "./AngleGuide";
 import AngleGuide from "./AngleGuide";
 
@@ -11,30 +12,49 @@ export interface CaptureResult {
   previewUrl: string;
   width: number;
   height: number;
-}
-
-export interface FaceQuality {
-  ok: boolean;
-  issue?: "no-face" | "multiple-faces" | "eyes-closed" | "dim" | "bad-angle" | "too-far" | "too-close";
-  detail?: string;
+  /** What the local check thought. The server still decides. */
+  verdict?: PhotoVerdict;
 }
 
 interface Props {
   angle: AngleKey;
   onCapture: (res: CaptureResult) => void;
-  /** When not null, this is the error message shown for the current frame quality check */
-  qualityHint?: FaceQuality | null;
-  /** Called every time the quality changes (used by parent to decide if capture allowed) */
-  onQualityChange?: (q: FaceQuality) => void;
+  /** Called every time the live verdict changes, so a parent can gate its own UI. */
+  onQualityChange?: (v: PhotoVerdict) => void;
   disabled?: boolean;
+  /**
+   * Set false for angles a frontal detector cannot read (true profiles, backs,
+   * distant full-body). Those frames are wanted in the set — the shot plan asks
+   * for them — so the capture button must not be held hostage to a detector
+   * that was never going to find a face in them.
+   */
+  faceExpected?: boolean;
 }
 
 /**
- * Webcam-based face capture with optional MediaPipe quality gate.
- * Designed so MediaPipe is loaded asynchronously and never required
- * (falls back to "always ok" so users on weird devices can still upload).
+ * Webcam capture with a live framing check.
+ *
+ * THE CHECK HERE IS ADVISORY. It exists to give feedback while someone is still
+ * standing in front of the camera, and it is deliberately the same RULES as the
+ * server (imported from @lora-scan/face-qc) but NOT the same detector: this runs
+ * MediaPipe BlazeFace in the browser, while training runs InsightFace. A frame
+ * can satisfy BlazeFace and still yield no embedding at training time, so the
+ * server re-checks everything on upload and its answer is the one that counts.
+ *
+ * Sharing the rules module is what keeps the two honest. The previous version of
+ * this component had its own thresholds — a LINEAR box-width ratio capped at 0.7
+ * — while the server judged face AREA against 0.45 and also required a clear
+ * margin at every edge. A face at 0.7 width scores about 0.49 area, so the
+ * camera said "Looks good — ready to capture" for framing the server then
+ * rejected, and cropped-at-the-edge shots sailed through with no check at all.
  */
-export default function FaceScanner({ angle, onCapture, onQualityChange, disabled }: Props) {
+export default function FaceScanner({
+  angle,
+  onCapture,
+  onQualityChange,
+  disabled,
+  faceExpected = true,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -43,12 +63,23 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
   const [ready, setReady] = useState(false);
   const [webcamErr, setWebcamErr] = useState<string | null>(null);
   const [useUploadFallback, setUseUploadFallback] = useState(false);
-  const [quality, setQuality] = useState<FaceQuality>({ ok: false, issue: "no-face", detail: "Warming up…" });
+  const [verdict, setVerdict] = useState<PhotoVerdict>({
+    file: "live",
+    ok: true,
+    severity: "unknown",
+    width: 0,
+    height: 0,
+    reasons: ["Warming up…"],
+  });
   const [preview, setPreview] = useState<string | null>(null);
-  const mpRef = useRef<{ face: any; detector: any } | null>(null);
+  const [fileVerdict, setFileVerdict] = useState<PhotoVerdict | null>(null);
+  const detectorRef = useRef<any>(null);
   const rafRef = useRef<number | null>(null);
 
-  useEffect(() => { onQualityChange?.(quality); /* eslint-disable-next-line */ }, [quality.ok, quality.issue]);
+  useEffect(() => {
+    onQualityChange?.(verdict);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verdict.severity, verdict.reasons[0]]);
 
   // --- Start webcam + async load MediaPipe -----------------------------
   useEffect(() => {
@@ -72,7 +103,7 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
       }
     })();
 
-    // Lazy-load MediaPipe (optional — a quality helper, never required)
+    // Lazy-load MediaPipe — a feedback helper, never a requirement.
     (async () => {
       try {
         const { FilesetResolver, FaceDetector } = await import(
@@ -88,11 +119,15 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
           runningMode: "VIDEO",
         });
         if (cancelled) return;
-        mpRef.current = { detector };
+        detectorRef.current = detector;
       } catch (e) {
-        console.warn("[FaceScanner] MediaPipe unavailable, quality gate disabled.", e);
-        // Mark as "always ok" so the capture button is enabled
-        setQuality({ ok: true });
+        console.warn("[FaceScanner] MediaPipe unavailable — live framing check disabled.", e);
+        // `unknown`, not `ok`: the capture button unblocks (below), but the UI
+        // says the framing was not checked rather than claiming it passed.
+        setVerdict({
+          file: "live", ok: true, severity: "unknown", width: 0, height: 0,
+          reasons: ["Live check unavailable — your photo is still checked on upload."],
+        });
       }
     })();
 
@@ -100,10 +135,11 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
       cancelled = true;
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      try { detectorRef.current?.close?.(); } catch { /* already gone */ }
     };
   }, []);
 
-  // --- Quality-check loop ---------------------------------------------
+  // --- Live check loop --------------------------------------------------
   useEffect(() => {
     if (!ready || useUploadFallback) return;
     let last = performance.now();
@@ -111,15 +147,12 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
     const tick = () => {
       const now = performance.now();
       const v = videoRef.current;
-      if (v && v.readyState >= 2 && mpRef.current) {
-        if (now - last > 250) {
-          try {
-            const r = mpRef.current.detector.detectForVideo(v, now);
-            const faces = r?.detections ?? [];
-            setQuality(evaluate(faces, v));
-          } catch {}
-          last = now;
-        }
+      if (v && v.readyState >= 2 && detectorRef.current && now - last > 250) {
+        try {
+          const r = detectorRef.current.detectForVideo(v, now);
+          setVerdict(evaluateLive(r?.detections ?? [], v));
+        } catch { /* a dropped frame is not worth reporting */ }
+        last = now;
       }
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -127,15 +160,20 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [ready, useUploadFallback]);
 
-  // --- File fallback handler ------------------------------------------
+  // --- File fallback ----------------------------------------------------
+  // Checked with the same rules as the live view. Previously this path ran no
+  // check at all, which meant the easiest way to submit an unusable photo was
+  // to click "Use file upload".
   const handleFile = async (file: File) => {
     const img = await fileToImage(file);
     const { blob, url, w, h } = await drawAndEncode(img, img.naturalWidth, img.naturalHeight);
+    const v = await evaluateStill(img, file.name, w, h);
+    setFileVerdict(v);
     setPreview(url);
-    onCapture({ bytes: blob, previewUrl: url, width: w, height: h });
+    onCapture({ bytes: blob, previewUrl: url, width: w, height: h, verdict: v });
   };
 
-  // --- Capture from webcam --------------------------------------------
+  // --- Capture from webcam ----------------------------------------------
   const capture = useCallback(async () => {
     if (disabled) return;
     const v = videoRef.current;
@@ -144,8 +182,11 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
     const h = v.videoHeight;
     const { blob, url } = await drawAndEncode(v, w, h);
     setPreview(url);
-    onCapture({ bytes: blob, previewUrl: url, width: w, height: h });
-  }, [disabled, onCapture]);
+    onCapture({ bytes: blob, previewUrl: url, width: w, height: h, verdict: verdict });
+  }, [disabled, onCapture, verdict]);
+
+  // A hard reject blocks capture only where a face was actually expected.
+  const blocked = faceExpected && verdict.severity === "reject";
 
   return (
     <div className="w-full">
@@ -194,20 +235,22 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
       {!useUploadFallback && (
         <div className="mt-4 flex flex-col sm:flex-row items-center gap-3">
           <div className="flex-1 text-sm min-h-[2.2rem]">
-            {quality.ok ? (
-              <span className="badge badge-success">Looks good — ready to capture</span>
-            ) : quality.issue ? (
-              <span className="badge badge-warn">{issueText(quality)}</span>
-            ) : null}
+            <VerdictBadge verdict={verdict} faceExpected={faceExpected} />
           </div>
           <div className="flex gap-2">
             <button className="btn-ghost" onClick={() => setUseUploadFallback(true)}>Use file upload</button>
             <button
               className="btn-primary"
-              disabled={disabled || !ready || !quality.ok}
+              disabled={disabled || !ready || blocked}
               onClick={capture}
             >Capture this angle</button>
           </div>
+        </div>
+      )}
+
+      {fileVerdict && useUploadFallback && (
+        <div className="mt-4 text-sm">
+          <VerdictBadge verdict={fileVerdict} faceExpected={faceExpected} />
         </div>
       )}
 
@@ -223,31 +266,87 @@ export default function FaceScanner({ angle, onCapture, onQualityChange, disable
   );
 }
 
-function issueText(q: FaceQuality) {
-  switch (q.issue) {
-    case "no-face":         return "No face detected — center your face in the oval";
-    case "multiple-faces":  return "Multiple faces — make sure only you are in frame";
-    case "eyes-closed":     return "Please keep your eyes open";
-    case "dim":             return "Lighting is too dim — turn on a light";
-    case "bad-angle":       return "Adjust your pose to match the guide";
-    case "too-far":         return "Move closer to the camera";
-    case "too-close":       return "Move a bit further away";
-    default:                return q.detail ?? "Adjust position…";
+function VerdictBadge({ verdict, faceExpected }: { verdict: PhotoVerdict; faceExpected: boolean }) {
+  if (verdict.severity === "ok") {
+    return <span className="badge badge-success">Looks good — ready to capture</span>;
   }
+  if (verdict.severity === "unknown") {
+    return <span className="badge">{verdict.reasons[0]}</span>;
+  }
+  // On an angle where no face is expected, a "reject" is the detector doing
+  // exactly what it should on a profile or a back. Saying "rejected" there
+  // teaches the user to distrust a shot the plan asked them for.
+  if (verdict.severity === "reject" && !faceExpected) {
+    return <span className="badge">No face in frame — expected for this angle</span>;
+  }
+  return (
+    <span className={verdict.severity === "reject" ? "badge badge-warn" : "badge"}>
+      {verdict.reasons[0]}
+    </span>
+  );
 }
 
-function evaluate(faces: any[], v: HTMLVideoElement): FaceQuality {
-  if (faces.length === 0) return { ok: false, issue: "no-face" };
-  if (faces.length > 1) return { ok: false, issue: "multiple-faces" };
-  const f = faces[0];
-  const box = f.boundingBox;
-  if (!box) return { ok: true };
-  const rel = box.width / v.videoWidth;
-  if (rel < 0.2) return { ok: false, issue: "too-far" };
-  if (rel > 0.7) return { ok: false, issue: "too-close" };
+/** MediaPipe detections -> the shared rules. */
+function evaluateLive(detections: any[], v: HTMLVideoElement): PhotoVerdict {
+  const w = v.videoWidth;
+  const h = v.videoHeight;
+  return checkFrame(
+    {
+      file: "live",
+      width: w,
+      height: h,
+      faces: detections.map((d) => {
+        const b = d.boundingBox ?? {};
+        // MediaPipe reports originX/originY plus width/height, in pixels.
+        const x1 = b.originX ?? 0;
+        const y1 = b.originY ?? 0;
+        return { x1, y1, x2: x1 + (b.width ?? 0), y2: y1 + (b.height ?? 0) };
+      }),
+    },
+    // The live view is a preview, not the stored frame: skip the minimum-size
+    // rule so a 720p webcam is not permanently scolded for a rule the uploaded
+    // JPEG will satisfy anyway.
+    { ...DEFAULT_THRESHOLDS, minDimension: 0 },
+  );
+}
 
-  // Keypoint-based lighting check via video canvas is expensive; skip by default.
-  return { ok: true };
+/**
+ * One-shot check of a still, used for the file-upload path.
+ * Loads its own detector in IMAGE mode; falls back to `unknown` if unavailable.
+ */
+async function evaluateStill(
+  img: HTMLImageElement,
+  name: string,
+  w: number,
+  h: number,
+): Promise<PhotoVerdict> {
+  try {
+    const { FilesetResolver, FaceDetector } = await import("@mediapipe/tasks-vision");
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+    );
+    const detector = await FaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+        delegate: "GPU",
+      },
+      runningMode: "IMAGE",
+    });
+    const r = detector.detect(img);
+    const faces = (r?.detections ?? []).map((d: any) => {
+      const b = d.boundingBox ?? {};
+      const x1 = b.originX ?? 0;
+      const y1 = b.originY ?? 0;
+      return { x1, y1, x2: x1 + (b.width ?? 0), y2: y1 + (b.height ?? 0) };
+    });
+    detector.close();
+    return checkFrame({ file: name, width: w, height: h, faces });
+  } catch {
+    // No `faces` key at all -> the shared rules return `unknown`, which is the
+    // truth: this photo has not been checked yet, and the server will do it.
+    return checkFrame({ file: name, width: w, height: h });
+  }
 }
 
 function fileToImage(file: File): Promise<HTMLImageElement> {

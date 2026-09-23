@@ -49,3 +49,8 @@ pids
 .idea
 .DS_Store
 Thumbs.db
+
+# Next.js generated
+apps/frontend/next-env.d.ts
+*.tsbuildinfo
+packages/*/package-lock.json

@@ -1,0 +1,28 @@
+# Local Postgres for development.
+#
+# The Prisma schema needs a real Postgres: it uses enums, a scalar list and
+# JSON-ish columns, and Prisma's sqlite connector supports none of them.
+#
+#   docker compose up -d db
+#   npm run migrate:dev
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: lorascan-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: loras
+      POSTGRES_PASSWORD: loras
+      POSTGRES_DB: lorascan
+    ports:
+      - "5432:5432"
+    volumes:
+      - lorascan-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loras -d lorascan"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  lorascan-pgdata:

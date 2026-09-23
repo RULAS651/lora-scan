@@ -1,5 +1,14 @@
-import { PrismaClient, JobStatus, LoRAStatus, ScanSessionStatus, ScanAngle } from "@prisma/client";
+import {
+  PrismaClient,
+  JobStatus,
+  LoRAStatus,
+  ScanSessionStatus,
+  ScanAngle,
+  ScanDistance,
+  ImageSource,
+} from "@prisma/client";
 import crypto from "crypto";
+import type { PhotoVerdict } from "@lora-scan/face-qc";
 import {
   encryptAndStore,
   scheduleScanPurge,
@@ -20,7 +29,11 @@ import { writeAudit } from "../middleware/auditLog";
 
 const prisma = new PrismaClient();
 
-const MANDATORY_ANGLES: ScanAngle[] = [
+// Angles the guided photo path walks through. Used to tell a photo-shoot user
+// what they have not taken yet -- NOT as a gate: frames pulled from a video
+// walk-around are all labelled OTHER, so requiring one of each would refuse
+// every video-sourced set. Readiness is judged on usable faces instead.
+const GUIDED_ANGLES: ScanAngle[] = [
   ScanAngle.FRONT,
   ScanAngle.ANGLE_45L,
   ScanAngle.ANGLE_45R,
@@ -28,7 +41,13 @@ const MANDATORY_ANGLES: ScanAngle[] = [
   ScanAngle.PROFILE_R,
 ];
 
-const MAX_IMG = Number(process.env.SCAN_MAX_IMAGES_PER_SESSION ?? 15);
+/** Frames with no usable face still train build and hair; they just do not count. */
+const MIN_USABLE_TO_TRAIN = Number(process.env.QC_MIN_USABLE ?? 15);
+
+// Must clear the shot plan (25) with room for a video import on top. At 15 a
+// correctly shot set hit the ceiling two thirds of the way through and the
+// remaining uploads failed with a size error rather than anything explanatory.
+const MAX_IMG = Number(process.env.SCAN_MAX_IMAGES_PER_SESSION ?? 60);
 
 function genTriggerWord() {
   return "sks" + crypto.randomBytes(4).toString("hex");
@@ -54,6 +73,17 @@ export async function appendScanImage(params: {
   deIdentify: boolean;
   width?: number;
   height?: number;
+  distance?: ScanDistance;
+  source?: ImageSource;
+  /**
+   * The framing verdict for this frame. Stored rather than discarded: when a
+   * trained LoRA comes back weak, the first question is what the set actually
+   * looked like, and without this the answer is unknowable after the raw scans
+   * are purged.
+   */
+  qc?: PhotoVerdict;
+  qcDetector?: string;
+  qcAuthoritative?: boolean;
 }) {
   const sess = await prisma.scanSession.findUnique({ where: { id: params.scanSessionId } });
   if (!sess) { const e: any = new Error("Scan session not found"); e.statusCode = 404; throw e; }
@@ -81,6 +111,15 @@ export async function appendScanImage(params: {
       width: params.width,
       height: params.height,
       deIdentified: params.deIdentify,
+      distance: params.distance ?? ScanDistance.CLOSEUP,
+      source: params.source ?? ImageSource.UPLOAD,
+      qcSeverity: params.qc?.severity,
+      qcDetector: params.qcDetector,
+      qcAuthoritative: params.qcAuthoritative,
+      qcFaces: params.qc?.faces,
+      qcFacePx: params.qc?.facePx,
+      qcFaceAreaPct: params.qc?.faceAreaPct,
+      qcReasons: params.qc ? JSON.stringify(params.qc.reasons) : undefined,
     },
   });
   await writeAudit({
@@ -88,7 +127,14 @@ export async function appendScanImage(params: {
     actorId: params.memberId,
     action: "SCAN_IMAGE_UPLOAD",
     targetId: params.scanSessionId,
-    metadata: { angle: params.angle, size: stored.blobSizeBytes },
+    // No image content in the audit trail — only the shape of what was stored.
+    metadata: {
+      angle: params.angle,
+      distance: params.distance ?? ScanDistance.CLOSEUP,
+      source: params.source ?? ImageSource.UPLOAD,
+      size: stored.blobSizeBytes,
+      qc: params.qc?.severity,
+    },
   });
   return img;
 }
@@ -107,12 +153,21 @@ export async function finalizeAndSubmitTraining(params: {
   if (sess.status !== ScanSessionStatus.DRAFT && sess.status !== ScanSessionStatus.FAILED) {
     const e: any = new Error("Session not in DRAFT/FAILED state"); e.statusCode = 409; throw e;
   }
-  const presentAngles = new Set(sess.images.map((i) => i.angle));
-  const missing = MANDATORY_ANGLES.filter((a) => !presentAngles.has(a));
-  if (missing.length > 0) {
-    const e: any = new Error(`Missing mandatory angles: ${missing.join(", ")}`);
+  // Enough frames that actually carry a face. Sets uploaded before QC existed
+  // have no severity recorded at all, and must not be blocked by a check that
+  // never ran against them.
+  const checked = sess.images.some((i) => i.qcSeverity && i.qcSeverity !== "unknown");
+  const usable = sess.images.filter((i) => i.qcSeverity !== "reject").length;
+  if (checked && usable < MIN_USABLE_TO_TRAIN) {
+    const e: any = new Error(
+      `Only ${usable} of ${sess.images.length} photos show a usable face; ` +
+      `${MIN_USABLE_TO_TRAIN} are needed. Add more angles before training.`,
+    );
     e.statusCode = 400;
     throw e;
+  }
+  if (sess.images.length === 0) {
+    const e: any = new Error("This session has no photos yet."); e.statusCode = 400; throw e;
   }
 
   // Decrypt all images in-memory to build workflow payloads.
@@ -161,7 +216,7 @@ export async function finalizeAndSubmitTraining(params: {
       scanSessionId: sess.id,
       status: JobStatus.QUEUED,
       provider: "RUNPOD",
-      workflowJson: workflow,
+      workflowJson: JSON.stringify(workflow),
     },
   });
 
@@ -314,14 +369,16 @@ export async function getMemberDashboardSummary(memberId: string) {
     _count: true,
   });
   const sessions = await prisma.scanSession.count({ where: { memberId, deletedAt: null } });
-  const storageBytes = (await prisma.scanImage.aggregate({
+  const scanBytes = await prisma.scanImage.aggregate({
     where: { scanSession: { memberId, deletedAt: null }, deletedAt: null },
     _sum: { blobSizeBytes: true },
-  })._sum.blobSizeBytes ?? 0) + (
-    await prisma.loRA.aggregate({
-      where: { memberId, deletedAt: null }, _sum: { blobSizeBytes: true },
-    })._sum.blobSizeBytes ?? 0
-  );
+  });
+  const loraBytes = await prisma.loRA.aggregate({
+    where: { memberId, deletedAt: null },
+    _sum: { blobSizeBytes: true },
+  });
+  const storageBytes =
+    (scanBytes._sum.blobSizeBytes ?? 0) + (loraBytes._sum.blobSizeBytes ?? 0);
   return {
     loraCounts: Object.fromEntries(loras.map((g) => [g.status, g._count])) as Record<string, number>,
     scanSessions: sessions,

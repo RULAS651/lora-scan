@@ -14,7 +14,7 @@
     "prisma:deploy": "prisma migrate deploy"
   },
   "dependencies": {
-    "@mediapipe/tasks-vision": "^0.10.14",
+    "@lora-scan/face-qc": "*",
     "@prisma/client": "^5.14.0",
     "agenda": "^5.0.0",
     "axios": "^1.7.2",
@@ -23,6 +23,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.2.0",
+    "ffmpeg-static": "^5.2.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
@@ -47,5 +48,8 @@
     "ts-node-dev": "^2.0.0",
     "tsc-alias": "^1.8.10",
     "tsconfig-paths": "^4.2.0"
+  },
+  "optionalDependencies": {
+    "@vladmandic/human": "^3.3.0"
   }
 }
